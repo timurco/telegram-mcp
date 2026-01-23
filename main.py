@@ -3468,6 +3468,88 @@ async def get_message_reactions(
 
 @mcp.tool(
     annotations=ToolAnnotations(
+        title="Get Message Custom Emoji",
+        openWorldHint=True,
+        readOnlyHint=True,
+        idempotentHint=True,
+    )
+)
+@validate_id("chat_id")
+async def get_message_custom_emoji(
+    chat_id: Union[int, str],
+    message_id: int,
+) -> str:
+    """
+    Get custom emoji entities from a message, including their document IDs and sticker sets.
+
+    Args:
+        chat_id: The chat ID or username
+        message_id: The message ID to get custom emoji from
+    """
+    try:
+        from telethon.tl.types import MessageEntityCustomEmoji
+
+        entity = await client.get_entity(chat_id)
+        messages = await client.get_messages(entity, ids=message_id)
+        msg = messages
+
+        if not msg:
+            return json.dumps({"error": "Message not found"})
+
+        custom_emoji_list = []
+        if msg.entities:
+            for ent in msg.entities:
+                if isinstance(ent, MessageEntityCustomEmoji):
+                    custom_emoji_list.append({
+                        "document_id": str(ent.document_id),
+                        "offset": ent.offset,
+                        "length": ent.length,
+                        "text_at_position": msg.message[ent.offset:ent.offset + ent.length] if msg.message else "",
+                    })
+
+        # Try to get sticker set info for each custom emoji
+        if custom_emoji_list:
+            doc_ids = [int(e["document_id"]) for e in custom_emoji_list]
+            try:
+                result = await client(functions.messages.GetCustomEmojiDocumentsRequest(document_id=doc_ids))
+                sticker_sets = {}
+                for doc in result:
+                    doc_id = str(doc.id)
+                    for attr in doc.attributes:
+                        if hasattr(attr, "stickerset"):
+                            sticker_sets[doc_id] = {
+                                "stickerset_id": attr.stickerset.id if hasattr(attr.stickerset, "id") else None,
+                                "stickerset_access_hash": attr.stickerset.access_hash if hasattr(attr.stickerset, "access_hash") else None,
+                            }
+                        if hasattr(attr, "alt"):
+                            if doc_id not in sticker_sets:
+                                sticker_sets[doc_id] = {}
+                            sticker_sets[doc_id]["alt"] = attr.alt
+
+                for emoji in custom_emoji_list:
+                    if emoji["document_id"] in sticker_sets:
+                        emoji.update(sticker_sets[emoji["document_id"]])
+            except Exception as e:
+                logger.warning(f"Could not get sticker set info: {e}")
+
+        return json.dumps(
+            {
+                "chat_id": str(chat_id),
+                "message_id": message_id,
+                "message_text": msg.message,
+                "custom_emoji_count": len(custom_emoji_list),
+                "custom_emoji": custom_emoji_list,
+            },
+            indent=2,
+            default=json_serializer,
+        )
+    except Exception as e:
+        logger.exception(f"get_message_custom_emoji failed (chat_id={chat_id}, message_id={message_id})")
+        return log_and_format_error("get_message_custom_emoji", e, chat_id=chat_id, message_id=message_id)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
         title="Get Available Reactions",
         openWorldHint=True,
         readOnlyHint=True,
