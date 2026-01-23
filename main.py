@@ -3318,6 +3318,7 @@ async def send_reaction(
     message_id: int,
     emoji: str,
     big: bool = False,
+    custom_emoji_id: Optional[str] = None,
 ) -> str:
     """
     Send a reaction to a message.
@@ -3327,17 +3328,29 @@ async def send_reaction(
         message_id: The message ID to react to
         emoji: The emoji to react with (e.g., "👍", "❤️", "🔥", "😂", "😮", "😢", "🎉", "💩", "👎")
         big: Whether to show a big animation for the reaction (default: False)
+        custom_emoji_id: Optional custom emoji document ID for Premium reactions.
+                        If provided, uses ReactionCustomEmoji instead of standard reaction.
     """
     try:
-        from telethon.tl.types import ReactionEmoji
+        from telethon.tl.types import ReactionEmoji, ReactionCustomEmoji
 
         peer = await client.get_input_entity(chat_id)
+
+        if custom_emoji_id is not None:
+            # Convert string to int (strings used to preserve precision for large IDs)
+            doc_id = int(custom_emoji_id)
+            # Use Premium custom emoji reaction
+            reaction = [ReactionCustomEmoji(document_id=doc_id)]
+        else:
+            # Use standard emoji reaction
+            reaction = [ReactionEmoji(emoticon=emoji)]
+
         await client(
             functions.messages.SendReactionRequest(
                 peer=peer,
                 msg_id=message_id,
                 big=big,
-                reaction=[ReactionEmoji(emoticon=emoji)],
+                reaction=reaction,
             )
         )
         return f"Reaction '{emoji}' sent to message {message_id} in chat {chat_id}."
@@ -3451,6 +3464,114 @@ async def get_message_reactions(
         return log_and_format_error(
             "get_message_reactions", e, chat_id=chat_id, message_id=message_id
         )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Get Available Reactions",
+        openWorldHint=True,
+        readOnlyHint=True,
+        idempotentHint=True,
+    )
+)
+@validate_id("chat_id")
+async def get_available_reactions(
+    chat_id: Union[int, str],
+) -> str:
+    """
+    Get available reactions for a chat. Shows standard emoji reactions and Premium custom emoji.
+
+    Args:
+        chat_id: The chat ID or username to get available reactions for
+    """
+    try:
+        from telethon.tl.types import (
+            ChatReactionsAll,
+            ChatReactionsSome,
+            ChatReactionsNone,
+            ReactionEmoji,
+            ReactionCustomEmoji,
+        )
+
+        entity = await client.get_entity(chat_id)
+
+        # Try to get chat-specific reactions
+        reactions_info = {
+            "chat_id": str(chat_id),
+            "standard_reactions": [],
+            "custom_emoji_reactions": [],
+            "allow_custom": False,
+            "note": "Standard reactions: 👍 👎 ❤️ 🔥 🥰 👏 😁 🤔 🤯 😱 🤬 😢 🎉 🤩 🤮 💩 🙏 👌 🕊 🤡 🥱 🥴 😍 🐳 ❤️‍🔥 🌚 🌭 💯 🤣 ⚡ 🍌 🏆 💔 🤨 😐 🍓 🍾 💋 🖕 😈 😴 😭 🤓 👻 👨‍💻 👀 🎃 🙈 😇 😨 🤝 ✍️ 🤗 🫡 🎅 🎄 ☃️ 💅 🤪 🗿 🆒 💘 🙉 🦄 😘 💊 🙊 😎 👾 🤷‍♂️ 🤷 🤷‍♀️ 😡"
+        }
+
+        # Check if the entity has available_reactions attribute
+        if hasattr(entity, 'available_reactions'):
+            available = entity.available_reactions
+            if isinstance(available, ChatReactionsAll):
+                reactions_info["allow_custom"] = available.allow_custom
+                reactions_info["note"] = "All standard reactions allowed" + (
+                    " + Premium custom emoji" if available.allow_custom else ""
+                )
+            elif isinstance(available, ChatReactionsSome):
+                for r in available.reactions:
+                    if isinstance(r, ReactionEmoji):
+                        reactions_info["standard_reactions"].append(r.emoticon)
+                    elif isinstance(r, ReactionCustomEmoji):
+                        reactions_info["custom_emoji_reactions"].append(r.document_id)
+            elif isinstance(available, ChatReactionsNone):
+                reactions_info["note"] = "Reactions are disabled in this chat"
+
+        return json.dumps(reactions_info, indent=2, default=json_serializer)
+    except Exception as e:
+        logger.exception(f"get_available_reactions failed (chat_id={chat_id})")
+        return log_and_format_error("get_available_reactions", e, chat_id=chat_id)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Search Custom Emoji",
+        openWorldHint=True,
+        readOnlyHint=True,
+        idempotentHint=True,
+    )
+)
+async def search_custom_emoji(
+    query: str,
+    limit: int = 20,
+) -> str:
+    """
+    Search for custom emoji by text query. Returns document IDs that can be used for Premium reactions.
+
+    Args:
+        query: Search term to find custom emoji (e.g., "snow", "fire", "heart")
+        limit: Maximum number of results to return (default: 20)
+    """
+    try:
+        # Search for emoji keywords/sticker sets that might contain the query
+        result = await client(
+            functions.messages.SearchCustomEmojiRequest(
+                emoticon=query,
+                hash=0,
+            )
+        )
+
+        # EmojiList returns document_id as a list of integers
+        # Convert to strings to preserve precision for large IDs
+        document_ids = [str(doc_id) for doc_id in result.document_id[:limit]] if result.document_id else []
+
+        return json.dumps(
+            {
+                "query": query,
+                "count": len(document_ids),
+                "document_ids": document_ids,
+                "usage": "Use any document_id with custom_emoji_id parameter in send_reaction for Premium reactions (pass as string)",
+            },
+            indent=2,
+            default=json_serializer,
+        )
+    except Exception as e:
+        logger.exception(f"search_custom_emoji failed (query={query})")
+        return log_and_format_error("search_custom_emoji", e, query=query)
 
 
 # ============================================================================
