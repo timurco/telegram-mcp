@@ -2823,13 +2823,25 @@ async def mark_as_read(chat_id: Union[int, str]) -> str:
     annotations=ToolAnnotations(title="Reply To Message", openWorldHint=True, destructiveHint=True)
 )
 @validate_id("chat_id")
-async def reply_to_message(chat_id: Union[int, str], message_id: int, text: str) -> str:
+async def reply_to_message(chat_id: Union[int, str], message_id: int, text: str, schedule: str = None) -> str:
     """
     Reply to a specific message in a chat.
+
+    Args:
+        chat_id: The chat ID or username.
+        message_id: The message ID to reply to (also used for forum topics).
+        text: The reply text.
+        schedule: Optional datetime string (ISO format: YYYY-MM-DDTHH:MM:SS) for scheduled delivery.
     """
     try:
         entity = await client.get_entity(chat_id)
-        await client.send_message(entity, text, reply_to=message_id)
+        schedule_date = None
+        if schedule:
+            from datetime import datetime
+            schedule_date = datetime.fromisoformat(schedule)
+        await client.send_message(entity, text, reply_to=message_id, schedule=schedule_date)
+        if schedule_date:
+            return f"Reply to message {message_id} scheduled for {schedule} in chat {chat_id}."
         return f"Replied to message {message_id} in chat {chat_id}."
     except Exception as e:
         return log_and_format_error(
