@@ -334,6 +334,31 @@ def get_engagement_info(message) -> str:
     return f" | {', '.join(engagement_parts)}" if engagement_parts else ""
 
 
+async def resolve_entity(entity_id):
+    """
+    Resolve an entity by ID with fallback to dialogs refresh.
+    Telethon caches entities in session - if not cached, we refresh from dialogs.
+    """
+    # First try direct lookup
+    try:
+        return await client.get_entity(entity_id)
+    except (ValueError, TypeError):
+        pass
+
+    # If it's not an integer user ID, can't do fallback
+    if not isinstance(entity_id, int) or entity_id < 0:
+        raise ValueError(f"Could not find entity: {entity_id}")
+
+    # Refresh entity cache from dialogs (fetches recent conversations)
+    await client.get_dialogs()
+
+    # Try again after refresh
+    try:
+        return await client.get_entity(entity_id)
+    except (ValueError, TypeError):
+        raise ValueError(f"Could not find entity {entity_id}. User must be in your dialogs or contacts.")
+
+
 @mcp.tool(annotations=ToolAnnotations(title="Get Chats", openWorldHint=True, readOnlyHint=True))
 async def get_chats(page: int = 1, page_size: int = 20) -> str:
     """
@@ -380,7 +405,7 @@ async def get_messages(chat_id: Union[int, str], page: int = 1, page_size: int =
         for msg in messages:
             sender_name = get_sender_name(msg)
             reply_info = ""
-            if msg.reply_to and msg.reply_to.reply_to_msg_id:
+            if msg.reply_to and hasattr(msg.reply_to, 'reply_to_msg_id') and msg.reply_to.reply_to_msg_id:
                 reply_info = f" | reply to {msg.reply_to.reply_to_msg_id}"
 
             engagement_info = get_engagement_info(msg)
@@ -399,16 +424,40 @@ async def get_messages(chat_id: Union[int, str], page: int = 1, page_size: int =
     annotations=ToolAnnotations(title="Send Message", openWorldHint=True, destructiveHint=True)
 )
 @validate_id("chat_id")
-async def send_message(chat_id: Union[int, str], message: str) -> str:
+async def send_message(chat_id: Union[int, str], message: str, schedule: str = None, custom_emoji: str = None) -> str:
     """
     Send a message to a specific chat.
     Args:
         chat_id: The ID or username of the chat.
         message: The message content to send.
+        schedule: Optional datetime string (ISO format: YYYY-MM-DDTHH:MM:SS) for scheduled delivery.
+        custom_emoji: Optional JSON array of custom emoji entities. Format: [{"offset": 0, "length": 2, "document_id": 123456789}]
     """
     try:
-        entity = await client.get_entity(chat_id)
-        await client.send_message(entity, message)
+        from telethon.tl.types import MessageEntityCustomEmoji
+        import json
+
+        entity = await resolve_entity(chat_id)
+        schedule_date = None
+        if schedule:
+            from datetime import datetime
+            schedule_date = datetime.fromisoformat(schedule)
+
+        formatting_entities = None
+        if custom_emoji:
+            emoji_list = json.loads(custom_emoji)
+            formatting_entities = [
+                MessageEntityCustomEmoji(
+                    offset=e["offset"],
+                    length=e["length"],
+                    document_id=e["document_id"]
+                )
+                for e in emoji_list
+            ]
+
+        await client.send_message(entity, message, schedule=schedule_date, formatting_entities=formatting_entities)
+        if schedule_date:
+            return f"Message scheduled for {schedule}."
         return "Message sent successfully."
     except Exception as e:
         return log_and_format_error("send_message", e, chat_id=chat_id)
@@ -813,7 +862,7 @@ async def list_messages(
             sender_name = get_sender_name(msg)
             message_text = msg.message or "[Media/No text]"
             reply_info = ""
-            if msg.reply_to and msg.reply_to.reply_to_msg_id:
+            if msg.reply_to and hasattr(msg.reply_to, 'reply_to_msg_id') and msg.reply_to.reply_to_msg_id:
                 reply_info = f" | reply to {msg.reply_to.reply_to_msg_id}"
 
             engagement_info = get_engagement_info(msg)
@@ -1262,7 +1311,7 @@ async def get_message_context(
 
             # Check if this message is a reply and get the replied message
             reply_content = ""
-            if msg.reply_to and msg.reply_to.reply_to_msg_id:
+            if msg.reply_to and hasattr(msg.reply_to, 'reply_to_msg_id') and msg.reply_to.reply_to_msg_id:
                 try:
                     replied_msg = await client.get_messages(chat, ids=msg.reply_to.reply_to_msg_id)
                     if replied_msg:
@@ -1646,21 +1695,120 @@ async def get_participants(chat_id: Union[int, str]) -> str:
 
 @mcp.tool(annotations=ToolAnnotations(title="Send File", openWorldHint=True, destructiveHint=True))
 @validate_id("chat_id")
-async def send_file(chat_id: Union[int, str], file_path: str, caption: str = None) -> str:
+async def send_file(chat_id: Union[int, str], file_path: str, caption: str = None, schedule: str = None, reply_to: int = None, custom_emoji: str = None, parse_mode: str = None) -> str:
     """
     Send a file to a chat.
     Args:
         chat_id: The chat ID or username.
         file_path: Absolute path to the file to send (must exist and be readable).
         caption: Optional caption for the file.
+        schedule: Optional datetime string (ISO format: YYYY-MM-DDTHH:MM:SS) for scheduled delivery.
+        reply_to: Optional message ID to reply to (also used for forum topics).
+        custom_emoji: Optional JSON array of custom emoji entities for caption. Format: [{"offset": 0, "length": 2, "document_id": 123456789}]
+        parse_mode: Optional parse mode for caption ('md' for Markdown, 'html' for HTML).
     """
     try:
+        from telethon.tl.types import MessageEntityCustomEmoji, MessageEntityBold, MessageEntityTextUrl
+        import json
+        import re
+
         if not os.path.isfile(file_path):
             return f"File not found: {file_path}"
         if not os.access(file_path, os.R_OK):
             return f"File is not readable: {file_path}"
         entity = await client.get_entity(chat_id)
-        await client.send_file(entity, file_path, caption=caption)
+        schedule_date = None
+        if schedule:
+            from datetime import datetime
+            schedule_date = datetime.fromisoformat(schedule)
+
+        formatting_entities = []
+        final_caption = caption
+
+        # Parse markdown if parse_mode is 'md' and custom_emoji is provided
+        if parse_mode == 'md' and caption and custom_emoji:
+            # Parse bold **text**
+            bold_pattern = r'\*\*(.+?)\*\*'
+            # Parse links [text](url)
+            link_pattern = r'\[([^\]]+)\]\(([^)]+)\)'
+
+            # First, find all markdown elements and their positions
+            elements = []
+
+            for m in re.finditer(bold_pattern, caption):
+                elements.append({
+                    'type': 'bold',
+                    'start': m.start(),
+                    'end': m.end(),
+                    'text': m.group(1),
+                    'full': m.group(0)
+                })
+
+            for m in re.finditer(link_pattern, caption):
+                elements.append({
+                    'type': 'link',
+                    'start': m.start(),
+                    'end': m.end(),
+                    'text': m.group(1),
+                    'url': m.group(2),
+                    'full': m.group(0)
+                })
+
+            # Sort by position
+            elements.sort(key=lambda x: x['start'])
+
+            # Build clean text and calculate new offsets
+            clean_caption = caption
+            offset_adjustment = 0
+
+            for el in elements:
+                adjusted_start = el['start'] - offset_adjustment
+                if el['type'] == 'bold':
+                    # Replace **text** with text
+                    clean_caption = clean_caption[:adjusted_start] + el['text'] + clean_caption[adjusted_start + len(el['full']):]
+                    # UTF-16 offset
+                    utf16_offset = len(clean_caption[:adjusted_start].encode('utf-16-le')) // 2
+                    utf16_length = len(el['text'].encode('utf-16-le')) // 2
+                    formatting_entities.append(MessageEntityBold(offset=utf16_offset, length=utf16_length))
+                    offset_adjustment += 4  # Remove 4 chars: ** **
+                elif el['type'] == 'link':
+                    # Replace [text](url) with text
+                    clean_caption = clean_caption[:adjusted_start] + el['text'] + clean_caption[adjusted_start + len(el['full']):]
+                    utf16_offset = len(clean_caption[:adjusted_start].encode('utf-16-le')) // 2
+                    utf16_length = len(el['text'].encode('utf-16-le')) // 2
+                    formatting_entities.append(MessageEntityTextUrl(offset=utf16_offset, length=utf16_length, url=el['url']))
+                    offset_adjustment += len(el['full']) - len(el['text'])
+
+            final_caption = clean_caption
+
+            # Add custom emoji entities (recalculate offsets for clean text)
+            if custom_emoji:
+                emoji_list = json.loads(custom_emoji)
+                for e in emoji_list:
+                    formatting_entities.append(
+                        MessageEntityCustomEmoji(
+                            offset=e["offset"],
+                            length=e["length"],
+                            document_id=e["document_id"]
+                        )
+                    )
+        elif custom_emoji:
+            emoji_list = json.loads(custom_emoji)
+            formatting_entities = [
+                MessageEntityCustomEmoji(
+                    offset=e["offset"],
+                    length=e["length"],
+                    document_id=e["document_id"]
+                )
+                for e in emoji_list
+            ]
+
+        final_entities = formatting_entities if formatting_entities else None
+        final_parse_mode = parse_mode if not custom_emoji else None
+
+        await client.send_file(entity, file_path, caption=final_caption, schedule=schedule_date, reply_to=reply_to, formatting_entities=final_entities, parse_mode=final_parse_mode)
+        if schedule_date:
+            return f"File scheduled for {schedule} to chat {chat_id}."
         return f"File sent to chat {chat_id}."
     except Exception as e:
         return log_and_format_error(
@@ -2714,6 +2862,35 @@ async def get_media_info(chat_id: Union[int, str], message_id: int) -> str:
 
 
 @mcp.tool(
+    annotations=ToolAnnotations(title="Transcribe Voice Message", openWorldHint=True, readOnlyHint=True)
+)
+@validate_id("chat_id")
+async def transcribe_voice(chat_id: Union[int, str], message_id: int) -> str:
+    """
+    Transcribe a voice message using Telegram Premium transcription.
+
+    Args:
+        chat_id: The chat ID or username.
+        message_id: The message ID of the voice message.
+    """
+    try:
+        from telethon.tl.functions.messages import TranscribeAudioRequest
+
+        entity = await client.get_entity(chat_id)
+        result = await client(TranscribeAudioRequest(
+            peer=entity,
+            msg_id=message_id
+        ))
+
+        if result.pending:
+            return f"Transcription in progress... (id: {result.transcription_id})"
+
+        return result.text or "No transcription available."
+    except Exception as e:
+        return log_and_format_error("transcribe_voice", e, chat_id=chat_id, message_id=message_id)
+
+
+@mcp.tool(
     annotations=ToolAnnotations(title="Search Public Chats", openWorldHint=True, readOnlyHint=True)
 )
 async def search_public_chats(query: str) -> str:
@@ -2743,7 +2920,7 @@ async def search_messages(chat_id: Union[int, str], query: str, limit: int = 20)
         for msg in messages:
             sender_name = get_sender_name(msg)
             reply_info = ""
-            if msg.reply_to and msg.reply_to.reply_to_msg_id:
+            if msg.reply_to and hasattr(msg.reply_to, 'reply_to_msg_id') and msg.reply_to.reply_to_msg_id:
                 reply_info = f" | reply to {msg.reply_to.reply_to_msg_id}"
             lines.append(
                 f"ID: {msg.id} | {sender_name} | Date: {msg.date}{reply_info} | Message: {msg.message}"
@@ -3117,7 +3294,7 @@ async def get_history(chat_id: Union[int, str], limit: int = 100) -> str:
         for msg in messages:
             sender_name = get_sender_name(msg)
             reply_info = ""
-            if msg.reply_to and msg.reply_to.reply_to_msg_id:
+            if msg.reply_to and hasattr(msg.reply_to, 'reply_to_msg_id') and msg.reply_to.reply_to_msg_id:
                 reply_info = f" | reply to {msg.reply_to.reply_to_msg_id}"
             lines.append(
                 f"ID: {msg.id} | {sender_name} | Date: {msg.date}{reply_info} | Message: {msg.message}"
@@ -3220,7 +3397,7 @@ async def get_pinned_messages(chat_id: Union[int, str]) -> str:
         for msg in messages:
             sender_name = get_sender_name(msg)
             reply_info = ""
-            if msg.reply_to and msg.reply_to.reply_to_msg_id:
+            if msg.reply_to and hasattr(msg.reply_to, 'reply_to_msg_id') and msg.reply_to.reply_to_msg_id:
                 reply_info = f" | reply to {msg.reply_to.reply_to_msg_id}"
             lines.append(
                 f"ID: {msg.id} | {sender_name} | Date: {msg.date}{reply_info} | Message: {msg.message or '[Media/No text]'}"
@@ -3243,6 +3420,8 @@ async def create_poll(
     quiz_mode: bool = False,
     public_votes: bool = True,
     close_date: str = None,
+    reply_to: int = None,
+    schedule: str = None,
 ) -> str:
     """
     Create a poll in a chat using Telegram's native poll feature.
@@ -3255,6 +3434,8 @@ async def create_poll(
         quiz_mode: Whether this is a quiz (has correct answer)
         public_votes: Whether votes are public
         close_date: Optional close date in ISO format (YYYY-MM-DD HH:MM:SS)
+        reply_to: Optional message ID to reply to (also used for forum topics)
+        schedule: Optional datetime string (ISO format: YYYY-MM-DDTHH:MM:SS) for scheduled delivery
     """
     try:
         entity = await client.get_entity(chat_id)
@@ -3273,8 +3454,13 @@ async def create_poll(
             except ValueError:
                 return f"Invalid close_date format. Use YYYY-MM-DD HH:MM:SS format."
 
+        # Parse schedule date if provided
+        schedule_date = None
+        if schedule:
+            schedule_date = datetime.fromisoformat(schedule)
+
         # Create the poll using InputMediaPoll with SendMediaRequest
-        from telethon.tl.types import InputMediaPoll, Poll, PollAnswer, TextWithEntities
+        from telethon.tl.types import InputMediaPoll, Poll, PollAnswer, TextWithEntities, InputReplyToMessage
         import random
 
         poll = Poll(
@@ -3296,15 +3482,52 @@ async def create_poll(
                 media=InputMediaPoll(poll=poll),
                 message="",
                 random_id=random.randint(0, 2**63 - 1),
+                reply_to=InputReplyToMessage(reply_to_msg_id=reply_to) if reply_to else None,
+                schedule_date=schedule_date,
             )
         )
 
+        if schedule_date:
+            return f"Poll scheduled for {schedule} in chat {chat_id}."
         return f"Poll created successfully in chat {chat_id}."
     except Exception as e:
         logger.exception(f"create_poll failed (chat_id={chat_id}, question='{question}')")
         return log_and_format_error(
             "create_poll", e, chat_id=chat_id, question=question, options=options
         )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(title="Get Scheduled Messages", openWorldHint=True, readOnlyHint=True)
+)
+@validate_id("chat_id")
+async def get_scheduled_messages(chat_id: Union[int, str]) -> str:
+    """
+    Get all scheduled messages in a chat.
+
+    Args:
+        chat_id: The chat ID or username.
+    """
+    try:
+        entity = await client.get_entity(chat_id)
+
+        result = await client(functions.messages.GetScheduledHistoryRequest(
+            peer=entity,
+            hash=0
+        ))
+
+        if not result.messages:
+            return "No scheduled messages found."
+
+        lines = []
+        for msg in result.messages:
+            date_str = msg.date.strftime("%Y-%m-%d %H:%M:%S") if msg.date else "Unknown"
+            text = msg.message if msg.message else "[Media/No text]"
+            lines.append(f"ID: {msg.id} | Scheduled: {date_str} | Message: {text}")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return log_and_format_error("get_scheduled_messages", e, chat_id=chat_id)
 
 
 @mcp.tool(
