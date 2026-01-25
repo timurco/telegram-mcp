@@ -171,7 +171,11 @@ def log_and_format_error(
     if user_message:
         return user_message
 
-    return f"An error occurred (code: {error_code}). Check mcp_errors.log for details."
+    # Include short error description
+    error_short = str(error)
+    if len(error_short) > 150:
+        error_short = error_short[:150] + "..."
+    return f"An error occurred (code: {error_code}): {error_short}. Check mcp_errors.log for details."
 
 
 def validate_id(*param_names_to_validate):
