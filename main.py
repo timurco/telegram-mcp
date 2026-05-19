@@ -2877,33 +2877,113 @@ async def get_media_info(chat_id: Union[int, str], message_id: int) -> str:
         return log_and_format_error("get_media_info", e, chat_id=chat_id, message_id=message_id)
 
 
+_GEMINI_TRANSCRIBE_SCRIPT_DEFAULT = "~/.claude/skills/gemini-transcribe/transcribe.sh"
+
+
+def _gemini_transcribe_script_path() -> Optional[str]:
+    raw = os.getenv("TELEGRAM_MCP_GEMINI_TRANSCRIBE_SCRIPT") or _GEMINI_TRANSCRIBE_SCRIPT_DEFAULT
+    path = os.path.expanduser(raw)
+    return path if os.path.isfile(path) else None
+
+
+async def _transcribe_with_gemini(entity, message_id: int) -> str:
+    import shutil
+    import tempfile
+
+    script_path = _gemini_transcribe_script_path()
+    if not script_path:
+        return (
+            "Gemini fallback unavailable: transcribe script not found. "
+            "Install ~/.claude/skills/gemini-transcribe/ or set "
+            "$TELEGRAM_MCP_GEMINI_TRANSCRIBE_SCRIPT to its location."
+        )
+
+    msg = await client.get_messages(entity, ids=message_id)
+    if not msg or not msg.media:
+        return "No media found in the specified message."
+
+    work_dir = tempfile.mkdtemp(prefix="tg-gemini-")
+    try:
+        media_path = await client.download_media(msg, file=work_dir)
+        if not media_path:
+            return "Failed to download media for Gemini transcription."
+
+        proc = await asyncio.create_subprocess_exec(
+            "bash", script_path, media_path, "--out", work_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            tail = (stderr or b"").decode(errors="replace").strip()
+            return f"Gemini transcription failed (exit {proc.returncode}): {tail[-800:]}"
+
+        base = os.path.splitext(os.path.basename(media_path))[0]
+        transcript_path = os.path.join(work_dir, f"{base}.transcript.md")
+        if not os.path.isfile(transcript_path):
+            tail = (stdout or b"").decode(errors="replace").strip()
+            return f"Gemini transcript file missing. Script output:\n{tail[-800:]}"
+
+        with open(transcript_path, "r", encoding="utf-8") as f:
+            text = f.read().strip()
+        return text or "Gemini returned an empty transcript."
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
 @mcp.tool(
     annotations=ToolAnnotations(title="Transcribe Voice Message", openWorldHint=True, readOnlyHint=True)
 )
 @validate_id("chat_id")
-async def transcribe_voice(chat_id: Union[int, str], message_id: int) -> str:
+async def transcribe_voice(
+    chat_id: Union[int, str],
+    message_id: int,
+    force_gemini: bool = False,
+) -> str:
     """
-    Transcribe a voice message using Telegram Premium transcription.
+    Transcribe a voice/audio/video-note message.
+
+    Default flow: try Telegram Premium transcription first; on MSG_VOICE_TOO_LONG
+    or another recoverable transcription error, automatically fall back to Google
+    Gemini by downloading the media and invoking the local gemini-transcribe
+    skill script (~/.claude/skills/gemini-transcribe/transcribe.sh, overridable
+    via $TELEGRAM_MCP_GEMINI_TRANSCRIBE_SCRIPT). The script reads its API key
+    from $GEMINI_API_KEY or ~/.aim/config.json (.geminiApiKey).
 
     Args:
         chat_id: The chat ID or username.
-        message_id: The message ID of the voice message.
+        message_id: The message ID of the voice/audio message.
+        force_gemini: Skip Telegram Premium and go straight to Gemini. Useful
+            for long meetings/lectures or non-Premium chats.
     """
     try:
-        from telethon.tl.functions.messages import TranscribeAudioRequest
-
         entity = await client.get_entity(chat_id)
-        result = await client(TranscribeAudioRequest(
-            peer=entity,
-            msg_id=message_id
-        ))
 
-        if result.pending:
-            return f"Transcription in progress... (id: {result.transcription_id})"
+        if not force_gemini:
+            from telethon.tl.functions.messages import TranscribeAudioRequest
+            from telethon.errors import RPCError
+            try:
+                result = await client(TranscribeAudioRequest(peer=entity, msg_id=message_id))
+                if result.pending:
+                    return f"Transcription in progress... (id: {result.transcription_id})"
+                if result.text:
+                    return result.text
+            except RPCError as e:
+                msg = (getattr(e, "message", None) or str(e) or "").upper()
+                fallback_markers = (
+                    "MSG_VOICE_TOO_LONG",
+                    "TRANSCRIPTION_FAILED",
+                    "VOICE_TOO_LONG",
+                )
+                if not any(m in msg for m in fallback_markers):
+                    raise
 
-        return result.text or "No transcription available."
+        return await _transcribe_with_gemini(entity, message_id)
     except Exception as e:
-        return log_and_format_error("transcribe_voice", e, chat_id=chat_id, message_id=message_id)
+        return log_and_format_error(
+            "transcribe_voice", e,
+            chat_id=chat_id, message_id=message_id, force_gemini=force_gemini,
+        )
 
 
 @mcp.tool(
