@@ -508,7 +508,7 @@ async def get_messages(chat_id: Union[int, str], page: int = 1, page_size: int =
     annotations=ToolAnnotations(title="Send Message", openWorldHint=True, destructiveHint=True)
 )
 @validate_id("chat_id")
-async def send_message(chat_id: Union[int, str], message: str, schedule: str = None, custom_emoji: str = None) -> str:
+async def send_message(chat_id: Union[int, str], message: str, schedule: str = None, custom_emoji: str = None, parse_mode: str = None) -> str:
     """
     Send a message to a specific chat.
     Args:
@@ -516,6 +516,7 @@ async def send_message(chat_id: Union[int, str], message: str, schedule: str = N
         message: The message content to send.
         schedule: Optional datetime string (ISO format: YYYY-MM-DDTHH:MM:SS) for scheduled delivery.
         custom_emoji: Optional JSON array of custom emoji entities. Format: [{"offset": 0, "length": 2, "document_id": 123456789}]
+        parse_mode: Optional parse mode for message ('md' for Markdown, 'html' for HTML).
     """
     try:
         from telethon.tl.types import MessageEntityCustomEmoji
@@ -539,7 +540,10 @@ async def send_message(chat_id: Union[int, str], message: str, schedule: str = N
                 for e in emoji_list
             ]
 
-        await client.send_message(entity, message, schedule=schedule_date, formatting_entities=formatting_entities)
+        # Only use parse_mode if no custom_emoji (they conflict)
+        final_parse_mode = parse_mode if not custom_emoji else None
+
+        await client.send_message(entity, message, schedule=schedule_date, formatting_entities=formatting_entities, parse_mode=final_parse_mode)
         if schedule_date:
             return f"Message scheduled for {schedule}."
         return "Message sent successfully."
