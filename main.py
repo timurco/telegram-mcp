@@ -405,16 +405,19 @@ def get_engagement_info(message) -> str:
 async def resolve_entity(entity_id):
     """
     Resolve an entity by ID with fallback to dialogs refresh.
-    Telethon caches entities in session - if not cached, we refresh from dialogs.
+    Telethon caches entities in session - if not cached, we refresh from dialogs
+    and additionally try PeerChannel for positive ints that aren't known users.
     """
-    # First try direct lookup
+    from telethon.tl.types import PeerChannel, PeerChat
+
+    # First try direct lookup (works for usernames, cached entities, negative -100... IDs)
     try:
         return await client.get_entity(entity_id)
     except (ValueError, TypeError):
         pass
 
-    # If it's not an integer user ID, can't do fallback
-    if not isinstance(entity_id, int) or entity_id < 0:
+    # Strings (e.g. @username) that fail above can't be retried as PeerChannel
+    if not isinstance(entity_id, int):
         raise ValueError(f"Could not find entity: {entity_id}")
 
     # Refresh entity cache from dialogs (fetches recent conversations)
@@ -424,7 +427,20 @@ async def resolve_entity(entity_id):
     try:
         return await client.get_entity(entity_id)
     except (ValueError, TypeError):
-        raise ValueError(f"Could not find entity {entity_id}. User must be in your dialogs or contacts.")
+        pass
+
+    # Positive int that still didn't resolve as user - try as channel/chat
+    if entity_id > 0:
+        for peer_cls in (PeerChannel, PeerChat):
+            try:
+                return await client.get_entity(peer_cls(entity_id))
+            except (ValueError, TypeError):
+                continue
+
+    raise ValueError(
+        f"Could not find entity {entity_id}. Try @username, or check that you have access. "
+        f"For channels, the numeric ID may need the -100 prefix."
+    )
 
 
 @mcp.tool(annotations=ToolAnnotations(title="Get Chats", openWorldHint=True, readOnlyHint=True))
@@ -1784,7 +1800,7 @@ async def send_file(chat_id: Union[int, str], file_path: str, caption: str = Non
             return f"File not found: {file_path}"
         if not os.access(file_path, os.R_OK):
             return f"File is not readable: {file_path}"
-        entity = await client.get_entity(chat_id)
+        entity = await resolve_entity(chat_id)
         schedule_date = None
         if schedule:
             from datetime import datetime
