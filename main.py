@@ -63,14 +63,78 @@ TELEGRAM_SESSION_NAME = os.getenv("TELEGRAM_SESSION_NAME")
 # Check if a string session exists in environment, otherwise use file-based session
 SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING")
 
-mcp = FastMCP("telegram")
+# Transport / HTTP settings.
+# We default to streamable HTTP so a single always-on launchd daemon can serve
+# multiple Claude Code sessions concurrently (stdio is single-consumer and the
+# Telethon SQLite session file can't be opened by two processes at once).
+# Bind only to loopback for safety. Port 47821 picked from the unassigned
+# 47xxx range; override with TELEGRAM_MCP_HTTP_PORT if needed.
+TELEGRAM_MCP_TRANSPORT = (os.getenv("TELEGRAM_MCP_TRANSPORT") or "http").strip().lower()
+TELEGRAM_MCP_HTTP_HOST = os.getenv("TELEGRAM_MCP_HTTP_HOST") or "127.0.0.1"
+try:
+    TELEGRAM_MCP_HTTP_PORT = int(os.getenv("TELEGRAM_MCP_HTTP_PORT") or "47821")
+except ValueError:
+    TELEGRAM_MCP_HTTP_PORT = 47821
+
+mcp = FastMCP(
+    "telegram",
+    host=TELEGRAM_MCP_HTTP_HOST,
+    port=TELEGRAM_MCP_HTTP_PORT,
+)
+
+# Telethon's auto-reconnect can still leave _user_connected=False between drop
+# and re-up, causing tools to crash with "Cannot send requests while disconnected".
+# We pass connection_retries=-1 (infinite) and a small retry_delay so the
+# underlying sender keeps retrying instead of giving up.
+_CLIENT_KWARGS = dict(connection_retries=-1, retry_delay=2, auto_reconnect=True)
 
 if SESSION_STRING:
     # Use the string session if available
-    client = TelegramClient(StringSession(SESSION_STRING), TELEGRAM_API_ID, TELEGRAM_API_HASH)
+    client = TelegramClient(StringSession(SESSION_STRING), TELEGRAM_API_ID, TELEGRAM_API_HASH, **_CLIENT_KWARGS)
 else:
     # Use file-based session
-    client = TelegramClient(TELEGRAM_SESSION_NAME, TELEGRAM_API_ID, TELEGRAM_API_HASH)
+    client = TelegramClient(TELEGRAM_SESSION_NAME, TELEGRAM_API_ID, TELEGRAM_API_HASH, **_CLIENT_KWARGS)
+
+
+# Wrap every @mcp.tool so each call (1) reconnects if disconnected before
+# running, and (2) retries once on a "Cannot send requests while disconnected"
+# error. Telethon's own auto_reconnect handles the socket, but in-flight
+# requests still raise ConnectionError — this wrapper absorbs that race.
+_original_mcp_tool = mcp.tool
+
+
+def _ensure_connected_tool(*tool_args, **tool_kwargs):
+    decorator = _original_mcp_tool(*tool_args, **tool_kwargs)
+
+    def apply(fn):
+        if not asyncio.iscoroutinefunction(fn):
+            return decorator(fn)
+
+        @wraps(fn)
+        async def wrapped(*a, **kw):
+            try:
+                if not client.is_connected():
+                    await client.connect()
+            except Exception:
+                pass
+            try:
+                return await fn(*a, **kw)
+            except ConnectionError as e:
+                msg = str(e).lower()
+                if "disconnect" in msg or "not connected" in msg:
+                    try:
+                        await client.connect()
+                    except Exception:
+                        raise e from None
+                    return await fn(*a, **kw)
+                raise
+
+        return decorator(wrapped)
+
+    return apply
+
+
+mcp.tool = _ensure_connected_tool
 
 # Setup robust logging with both file and console output
 logger = logging.getLogger("telegram_mcp")
@@ -4114,15 +4178,75 @@ async def clear_draft(chat_id: Union[int, str]) -> str:
         return log_and_format_error("clear_draft", e, chat_id=chat_id)
 
 
+async def _connection_keepalive() -> None:
+    """Background task: keep Telethon socket AND MTProto session alive.
+
+    Two tiers:
+      1) Cheap socket check every 15s (reconnects if socket died).
+      2) Active MTProto ping (get_me) every 60s. Telegram silently drops
+         MTProto sessions for idle clients behind NAT, and Telethon
+         doesn't notice until the next request raises ConnectionError.
+         A periodic round-trip keeps the session warm and forces an
+         early hard-reconnect if it died.
+    """
+    SOCKET_CHECK_INTERVAL = 15
+    PING_INTERVAL = 60
+    iterations_per_ping = max(1, PING_INTERVAL // SOCKET_CHECK_INTERVAL)
+    counter = 0
+
+    while True:
+        try:
+            if not client.is_connected():
+                logger.warning("telegram-mcp keepalive: client disconnected, reconnecting...")
+                await client.connect()
+                logger.info("telegram-mcp keepalive: reconnected (socket)")
+
+            counter += 1
+            if counter >= iterations_per_ping:
+                counter = 0
+                try:
+                    await asyncio.wait_for(client.get_me(), timeout=10)
+                except (ConnectionError, asyncio.TimeoutError, OSError) as ping_err:
+                    logger.warning(
+                        f"telegram-mcp keepalive: ping failed ({type(ping_err).__name__}: {ping_err}), "
+                        "forcing hard reconnect"
+                    )
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                    await client.connect()
+                    try:
+                        await client.start()
+                    except Exception:
+                        pass
+                    logger.info("telegram-mcp keepalive: hard-reconnected after ping failure")
+        except Exception:
+            logger.exception("telegram-mcp keepalive: unexpected error in loop")
+        await asyncio.sleep(SOCKET_CHECK_INTERVAL)
+
+
 async def _main() -> None:
     try:
         # Start the Telethon client non-interactively
         print("Starting Telegram client...")
         await client.start()
 
-        print("Telegram client started. Running MCP server...")
-        # Use the asynchronous entrypoint instead of mcp.run()
-        await mcp.run_stdio_async()
+        # Background reconnect watcher (5+ months of GEN-ERR-509 / disconnected errors otherwise)
+        asyncio.create_task(_connection_keepalive())
+
+        if TELEGRAM_MCP_TRANSPORT == "stdio":
+            print("Telegram client started. Running MCP server (stdio)...")
+            # Legacy single-consumer mode; kept for debugging only.
+            await mcp.run_stdio_async()
+        else:
+            print(
+                f"Telegram client started. Running MCP server (streamable-http) "
+                f"on http://{TELEGRAM_MCP_HTTP_HOST}:{TELEGRAM_MCP_HTTP_PORT}/mcp ..."
+            )
+            # Streamable HTTP — multi-consumer; one daemon process owns the
+            # Telethon session, any number of MCP clients connect via HTTP.
+            await mcp.run_streamable_http_async()
     except Exception as e:
         print(f"Error starting client: {e}", file=sys.stderr)
         if isinstance(e, sqlite3.OperationalError) and "database is locked" in str(e):
