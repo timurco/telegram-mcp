@@ -1987,6 +1987,58 @@ async def send_file(chat_id: Union[int, str], file_path: str, caption: str = Non
         )
 
 
+@mcp.tool(annotations=ToolAnnotations(title="Send Album", openWorldHint=True, destructiveHint=True))
+@validate_id("chat_id")
+async def send_album(chat_id: Union[int, str], file_paths: str, caption: str = None, schedule: str = None, reply_to: int = None, parse_mode: str = None) -> str:
+    """
+    Send multiple photos as an album (grouped media) to a chat.
+    Args:
+        chat_id: The chat ID or username.
+        file_paths: JSON array of absolute file paths, e.g. ["/tmp/photo1.jpg", "/tmp/photo2.jpg"]. Max 10 files.
+        caption: Optional caption for the album (attached to the first photo).
+        schedule: Optional datetime string (ISO format: YYYY-MM-DDTHH:MM:SS) for scheduled delivery.
+        reply_to: Optional message ID to reply to (also used for forum topics).
+        parse_mode: Optional parse mode for caption ('md' for Markdown, 'html' for HTML).
+    """
+    try:
+        import json
+
+        paths = json.loads(file_paths)
+        if not isinstance(paths, list) or len(paths) == 0:
+            return "file_paths must be a non-empty JSON array of file paths."
+        if len(paths) > 10:
+            return "Maximum 10 files per album."
+
+        for p in paths:
+            if not os.path.isfile(p):
+                return f"File not found: {p}"
+            if not os.access(p, os.R_OK):
+                return f"File is not readable: {p}"
+
+        entity = await client.get_entity(chat_id)
+        schedule_date = None
+        if schedule:
+            from datetime import datetime
+            schedule_date = datetime.fromisoformat(schedule)
+
+        await client.send_file(
+            entity,
+            paths,
+            caption=caption,
+            schedule=schedule_date,
+            reply_to=reply_to,
+            parse_mode=parse_mode,
+        )
+
+        if schedule_date:
+            return f"Album of {len(paths)} files scheduled for {schedule} to chat {chat_id}."
+        return f"Album of {len(paths)} files sent to chat {chat_id}."
+    except Exception as e:
+        return log_and_format_error(
+            "send_album", e, chat_id=chat_id, file_paths=file_paths, caption=caption
+        )
+
+
 @mcp.tool(
     annotations=ToolAnnotations(title="Download Media", openWorldHint=True, readOnlyHint=True)
 )
