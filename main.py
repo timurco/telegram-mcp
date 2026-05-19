@@ -1880,6 +1880,88 @@ async def send_file(chat_id: Union[int, str], file_path: str, caption: str = Non
                             document_id=e["document_id"]
                         )
                     )
+        # Parse HTML if parse_mode is 'html' and custom_emoji is provided
+        elif parse_mode == 'html' and caption and custom_emoji:
+            from telethon.tl.types import MessageEntityItalic
+            # Parse HTML tags
+            bold_pattern = r'<b>(.+?)</b>'
+            italic_pattern = r'<i>(.+?)</i>'
+            link_pattern = r'<a href="([^"]+)">(.+?)</a>'
+
+            # Find all HTML elements and their positions
+            elements = []
+
+            for m in re.finditer(bold_pattern, caption):
+                elements.append({
+                    'type': 'bold',
+                    'start': m.start(),
+                    'end': m.end(),
+                    'text': m.group(1),
+                    'full': m.group(0)
+                })
+
+            for m in re.finditer(italic_pattern, caption):
+                elements.append({
+                    'type': 'italic',
+                    'start': m.start(),
+                    'end': m.end(),
+                    'text': m.group(1),
+                    'full': m.group(0)
+                })
+
+            for m in re.finditer(link_pattern, caption):
+                elements.append({
+                    'type': 'link',
+                    'start': m.start(),
+                    'end': m.end(),
+                    'text': m.group(2),
+                    'url': m.group(1),
+                    'full': m.group(0)
+                })
+
+            # Sort by position
+            elements.sort(key=lambda x: x['start'])
+
+            # Build clean text and calculate new offsets
+            clean_caption = caption
+            offset_adjustment = 0
+
+            for el in elements:
+                adjusted_start = el['start'] - offset_adjustment
+                if el['type'] == 'bold':
+                    # Replace <b>text</b> with text
+                    clean_caption = clean_caption[:adjusted_start] + el['text'] + clean_caption[adjusted_start + len(el['full']):]
+                    utf16_offset = len(clean_caption[:adjusted_start].encode('utf-16-le')) // 2
+                    utf16_length = len(el['text'].encode('utf-16-le')) // 2
+                    formatting_entities.append(MessageEntityBold(offset=utf16_offset, length=utf16_length))
+                    offset_adjustment += 7  # Remove <b></b>
+                elif el['type'] == 'italic':
+                    # Replace <i>text</i> with text
+                    clean_caption = clean_caption[:adjusted_start] + el['text'] + clean_caption[adjusted_start + len(el['full']):]
+                    utf16_offset = len(clean_caption[:adjusted_start].encode('utf-16-le')) // 2
+                    utf16_length = len(el['text'].encode('utf-16-le')) // 2
+                    formatting_entities.append(MessageEntityItalic(offset=utf16_offset, length=utf16_length))
+                    offset_adjustment += 7  # Remove <i></i>
+                elif el['type'] == 'link':
+                    # Replace <a href="url">text</a> with text
+                    clean_caption = clean_caption[:adjusted_start] + el['text'] + clean_caption[adjusted_start + len(el['full']):]
+                    utf16_offset = len(clean_caption[:adjusted_start].encode('utf-16-le')) // 2
+                    utf16_length = len(el['text'].encode('utf-16-le')) // 2
+                    formatting_entities.append(MessageEntityTextUrl(offset=utf16_offset, length=utf16_length, url=el['url']))
+                    offset_adjustment += len(el['full']) - len(el['text'])
+
+            final_caption = clean_caption
+
+            # Add custom emoji entities
+            emoji_list = json.loads(custom_emoji)
+            for e in emoji_list:
+                formatting_entities.append(
+                    MessageEntityCustomEmoji(
+                        offset=e["offset"],
+                        length=e["length"],
+                        document_id=e["document_id"]
+                    )
+                )
         elif custom_emoji:
             emoji_list = json.loads(custom_emoji)
             formatting_entities = [
@@ -1892,7 +1974,8 @@ async def send_file(chat_id: Union[int, str], file_path: str, caption: str = Non
             ]
 
         final_entities = formatting_entities if formatting_entities else None
-        final_parse_mode = parse_mode if not custom_emoji else None
+        # Disable parse_mode when custom_emoji is used (we manually parse both md and html)
+        final_parse_mode = None if custom_emoji else parse_mode
 
         await client.send_file(entity, file_path, caption=final_caption, schedule=schedule_date, reply_to=reply_to, formatting_entities=final_entities, parse_mode=final_parse_mode)
         if schedule_date:
