@@ -96,6 +96,43 @@ else:
     client = TelegramClient(TELEGRAM_SESSION_NAME, TELEGRAM_API_ID, TELEGRAM_API_HASH, **_CLIENT_KWARGS)
 
 
+# --- Read-only mode -----------------------------------------------------
+#
+# `TELEGRAM_MCP_READONLY=1` registers ONLY the tools listed below; every
+# other tool is not registered at all, so it never appears in the client's
+# tool list and cannot be called even by an agent running with permission
+# prompts disabled.
+#
+# Why a whitelist and not a blacklist of `send_*`: a blacklist has to be
+# updated whenever a tool is added, and the one that is forgotten is the
+# one that writes. Here a new tool is unavailable until someone puts it
+# on this list deliberately.
+#
+# The account behind this session belongs to a human. An agent writing
+# from it produces messages his family and colleagues read as his own
+# words, and neither the chat nor the recipient shows any difference.
+READ_TOOLS = {
+    "download_media", "resolve_username", "transcribe_voice",
+    "get_admins", "get_available_reactions", "get_banned_users",
+    "get_blocked_users", "get_bot_info", "get_chat", "get_chats",
+    "get_contact_chats", "get_contact_ids", "get_direct_chat_by_contact",
+    "get_drafts", "get_gif_search", "get_history", "get_invite_link",
+    "get_last_interaction", "get_me", "get_media_info",
+    "get_message_context", "get_message_custom_emoji",
+    "get_message_reactions", "get_messages", "get_participants",
+    "get_pinned_messages", "get_privacy_settings", "get_recent_actions",
+    "get_scheduled_messages", "get_sticker_sets", "get_user_photos",
+    "get_user_status",
+    "list_chats", "list_contacts", "list_inline_buttons", "list_messages",
+    "list_topics",
+    "search_contacts", "search_custom_emoji", "search_messages",
+    "search_public_chats",
+}
+
+READONLY = (os.getenv("TELEGRAM_MCP_READONLY") or "").strip().lower() \
+    in ("1", "true", "yes", "on")
+
+
 # Wrap every @mcp.tool so each call (1) reconnects if disconnected before
 # running, and (2) retries once on a "Cannot send requests while disconnected"
 # error. Telethon's own auto_reconnect handles the socket, but in-flight
@@ -107,6 +144,11 @@ def _ensure_connected_tool(*tool_args, **tool_kwargs):
     decorator = _original_mcp_tool(*tool_args, **tool_kwargs)
 
     def apply(fn):
+        # Not registered at all, rather than registered and refusing:
+        # a tool that exists and answers "not allowed" invites the agent
+        # to look for a way around it.
+        if READONLY and fn.__name__ not in READ_TOOLS:
+            return fn
         if not asyncio.iscoroutinefunction(fn):
             return decorator(fn)
 
